@@ -1,0 +1,6 @@
+PySide6
+python-vlc
+opencv-python
+moviepy<2
+numpy
+proglog

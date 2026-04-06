@@ -12,12 +12,13 @@ from proglog import ProgressBarLogger
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QListWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFileDialog, QComboBox, QProgressBar, QCheckBox, QApplication,
-    QSplitter, QDialog, QSlider, QMessageBox, QGroupBox, QStackedWidget
+    QSplitter, QDialog, QSlider, QMessageBox, QGroupBox, QStackedWidget,
+    QTabWidget
 )
 # pyqtSignal 改为 Signal，添加 QThread
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QRect, QPoint
 from PySide6.QtGui import (
-    QIntValidator, QPainter, QColor, QPen, QBrush, QImage, QPixmap
+    QIntValidator, QPainter, QColor, QPen, QBrush, QImage, QPixmap, QPainterPath
 )
 from PySide6.QtWidgets import QFormLayout, QLineEdit
 
@@ -26,10 +27,30 @@ from moviepy.video.fx.all import speedx
 import shutil
 import subprocess
 
-# FFmpeg工具函数
+# 系统依赖检测工具函数
+def check_command_available(command_name):
+    """检查系统命令是否可用。"""
+    return shutil.which(command_name) is not None
+
+
 def check_ffmpeg_available():
     """检查系统是否安装了FFmpeg"""
-    return shutil.which('ffmpeg') is not None
+    return check_command_available('ffmpeg')
+
+
+def check_ffprobe_available():
+    """检查系统是否安装了 FFprobe。"""
+    return check_command_available('ffprobe')
+
+
+def get_missing_runtime_dependencies():
+    """返回当前缺失的 Ubuntu 运行依赖。"""
+    missing = []
+    if not check_ffmpeg_available():
+        missing.append("ffmpeg")
+    if not check_ffprobe_available():
+        missing.append("ffprobe")
+    return missing
 
 def check_aspect_ratio_consistency(video_paths):
     """
@@ -84,7 +105,6 @@ def check_aspect_ratio_consistency(video_paths):
     # 如果不一致，返回所有视频信息以便用户对比
     return is_consistent, video_info if not is_consistent else []
 
-
 def detect_max_resolution(video_paths):
     """
     检测所有视频的最大宽度和最大高度
@@ -116,6 +136,10 @@ def detect_max_resolution(video_paths):
 
 def get_video_fps(video_path):
     """使用FFmpeg获取视频帧率"""
+    if not check_ffprobe_available():
+        print("警告：未检测到 ffprobe，帧率将回退到默认值 30fps")
+        return 30.0
+
     try:
         cmd = [
             'ffprobe', '-v', 'error',
@@ -181,142 +205,161 @@ class PySideProgressBarLogger(ProgressBarLogger):
             print(f"进度更新(bars_callback): {percent}%")
             self.update_signal_callback(percent)
 
-# 彻底修复裁剪框透明度问题，采用四块遮罩拼接法
+
 class CropOverlay(QWidget):
     """
-    可拖动的裁剪框覆盖层
-    核心修复：采用拼接矩形遮罩法，确保裁剪框中心区域绝对透明。
+    自适应裁剪框覆盖层
+    修复：采用 QPainterPath 镂空技术，解决全屏变暗及坐标偏移问题。
     """
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 关键属性：允许透明背景
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setStyleSheet("background: transparent;")
         
-        # 裁剪框属性
-        self.crop_rect = QRect(50, 50, 300, 169)
-        self.aspect_ratio = 16/9
+        # 裁剪比例逻辑
+        self.aspect_ratio = 2/3
+        self.original_ratio = 16/9 
+        self.crop_rect = QRect(0, 0, 100, 150) # 初始占位，将被 set_aspect_ratio 覆盖
+        
         self.dragging = False
         self.resizing = False
         self.drag_start = QPoint()
         self.resize_corner = None
         
-        # 视觉常量
         self.handle_radius = 6
         self.hit_radius = 15
-        self.main_color = QColor(255, 215, 0) # 亮金色
-        self.mask_color = QColor(0, 0, 0, 150) # 半透明黑色遮罩 (0-255)
-        
-        self.video_display_rect = QRect()
+        self.main_color = QColor(255, 215, 0) 
+        self.mask_color = QColor(0, 0, 0, 150) 
+        self.video_display_rect = QRect() # 该矩形现在使用相对于自身的坐标 (local)
         
     def set_aspect_ratio(self, ratio_text):
-        """设置裁剪框比例，兼容不同的文本输入"""
-        ratio_map = {
-            "16:9 (横屏)": 16/9,
-            "9:16 (竖屏)": 9/16,
-            "2:3": 2/3,
-            "3:2": 3/2,
-            "1:1": 1.0
-        }
-        self.aspect_ratio = ratio_map.get(ratio_text, 16/9)
+        """设置比例并重置框体大小，尽量保持中心位置"""
+        if ratio_text == "2:3 (竖屏)":
+            self.aspect_ratio = 2/3
+        elif ratio_text == "16:9 (横屏)":
+            self.aspect_ratio = 16/9
+        elif ratio_text == "原始比例":
+            self.aspect_ratio = self.original_ratio
+        else:
+            return
+
+        old_center = self.crop_rect.center()
         
-        center = self.crop_rect.center()
-        width = self.crop_rect.width()
-        height = int(width / self.aspect_ratio)
+        # 初始计算尺寸
+        w = self.crop_rect.width()
+        if w < 50: w = 200 # 防止初始值过小
+        h = int(w / self.aspect_ratio)
         
-        self.crop_rect = QRect(0, 0, width, height)
-        self.crop_rect.moveCenter(center)
+        # 自适应缩放逻辑：防止超出显示区域导致的变形
+        if not self.video_display_rect.isEmpty():
+            max_w = self.video_display_rect.width() * 0.8
+            max_h = self.video_display_rect.height() * 0.8
+            
+            # 如果计算出的宽高太大，则按比例缩小
+            if h > max_h or w > max_w:
+                w = max_w
+                h = int(w / self.aspect_ratio)
+                if h > max_h:
+                    h = max_h
+                    w = int(h * self.aspect_ratio)
+
+        self.crop_rect = QRect(0, 0, int(w), int(h))
+        # 如果旧中心点在视频内，则移动过去；否则居中
+        if self.video_display_rect.contains(old_center):
+            self.crop_rect.moveCenter(old_center)
+        else:
+            self.crop_rect.moveCenter(self.video_display_rect.center())
+        
         self.constrain_to_video()
         self.update()
     
     def set_video_display_rect(self, rect):
+        """设置相对于覆盖层左上角的视频显示区域"""
         self.video_display_rect = rect
         self.constrain_to_video()
         self.update()
     
     def constrain_to_video(self):
-        """确保裁剪框不超出视频实际显示区域"""
+        """位置约束逻辑：确保裁剪框不出界"""
         if self.video_display_rect.isEmpty():
             return
         
-        # 限制大小
-        if self.crop_rect.width() > self.video_display_rect.width():
-            self.crop_rect.setWidth(self.video_display_rect.width())
-            self.crop_rect.setHeight(int(self.crop_rect.width() / self.aspect_ratio))
+        r = self.crop_rect
+        v = self.video_display_rect
         
-        if self.crop_rect.height() > self.video_display_rect.height():
-            self.crop_rect.setHeight(self.video_display_rect.height())
-            self.crop_rect.setWidth(int(self.crop_rect.height() * self.aspect_ratio))
+        # 限制大小不超标
+        if r.width() > v.width():
+            r.setWidth(v.width())
+            r.setHeight(int(v.width() / self.aspect_ratio))
+        if r.height() > v.height():
+            r.setHeight(v.height())
+            r.setWidth(int(v.height() * self.aspect_ratio))
+            
+        # 限制坐标在 v 的范围内
+        if r.left() < v.left(): r.moveLeft(v.left())
+        if r.right() > v.right(): r.moveRight(v.right())
+        if r.top() < v.top(): r.moveTop(v.top())
+        if r.bottom() > v.bottom(): r.moveBottom(v.bottom())
+        
+        self.crop_rect = r
 
-        # 限制位置
-        if self.crop_rect.left() < self.video_display_rect.left():
-            self.crop_rect.moveLeft(self.video_display_rect.left())
-        if self.crop_rect.right() > self.video_display_rect.right():
-            self.crop_rect.moveRight(self.video_display_rect.right())
-        if self.crop_rect.top() < self.video_display_rect.top():
-            self.crop_rect.moveTop(self.video_display_rect.top())
-        if self.crop_rect.bottom() > self.video_display_rect.bottom():
-            self.crop_rect.moveBottom(self.video_display_rect.bottom())
-    
     def get_crop_params(self, video_size):
+        """计算导出时映射到原视频的像素坐标"""
         if self.video_display_rect.isEmpty():
             return (0, 0, video_size[0], video_size[1])
         
+        # 换算比例
         scale_x = video_size[0] / self.video_display_rect.width()
         scale_y = video_size[1] / self.video_display_rect.height()
         
+        # 计算相对于显示区域左上角的坐标
         rel_x = self.crop_rect.x() - self.video_display_rect.x()
         rel_y = self.crop_rect.y() - self.video_display_rect.y()
         
-        orig_x = int(rel_x * scale_x)
-        orig_y = int(rel_y * scale_y)
-        orig_w = (int(self.crop_rect.width() * scale_x) // 2) * 2
-        orig_h = (int(self.crop_rect.height() * scale_y) // 2) * 2
-        
-        return (max(0, orig_x), max(0, orig_y), max(2, orig_w), max(2, orig_h))
+        return (max(0, int(rel_x * scale_x)), 
+                max(0, int(rel_y * scale_y)), 
+                max(2, (int(self.crop_rect.width() * scale_x) // 2) * 2), 
+                max(2, (int(self.crop_rect.height() * scale_y) // 2) * 2))
     
     def paintEvent(self, event):
-        """绘制裁剪框和遮罩"""
+        """
+        绘制：路径镂空法。
+        1. 绘制半透明遮罩（镂空中心）
+        2. 绘制黄色边框和三分线
+        3. 绘制手柄
+        """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        r = self.crop_rect
-        w, h = self.width(), self.height()
+        # 1. 创建镂空路径
+        main_path = QPainterPath()
+        main_path.addRect(self.rect()) # 整个组件区域
         
-        # 1. 绘制四个半透明矩形作为遮罩（避开中心，保证中心绝对透明）
+        crop_path = QPainterPath()
+        crop_path.addRect(self.crop_rect) # 裁剪框区域
+        
+        # 使用奇偶规则扣掉中心
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(self.mask_color)
+        painter.drawPath(main_path.subtracted(crop_path))
         
-        # 上遮罩
-        painter.drawRect(0, 0, w, r.top())
-        # 下遮罩
-        painter.drawRect(0, r.bottom(), w, h - r.bottom())
-        # 左遮罩
-        painter.drawRect(0, r.top(), r.left(), r.height())
-        # 右遮罩
-        painter.drawRect(r.right(), r.top(), w - r.right(), r.height())
-        
-        # 2. 绘制三分法辅助线（仅在裁剪框内绘制）
-        painter.setPen(QPen(QColor(255, 255, 255, 50), 1))
-        x_step = r.width() / 3
-        y_step = r.height() / 3
+        # 2. 绘制辅助线和边框
+        r = self.crop_rect
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+        x_step, y_step = r.width() / 3, r.height() / 3
         for i in range(1, 3):
-            # 纵向线
             painter.drawLine(int(r.left() + i * x_step), r.top(), int(r.left() + i * x_step), r.bottom())
-            # 横向线
             painter.drawLine(r.left(), int(r.top() + i * y_step), r.right(), int(r.top() + i * y_step))
         
-        # 3. 绘制黄色主边框
         painter.setPen(QPen(self.main_color, 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(r)
         
-        # 4. 绘制控制点圆形手柄
+        # 3. 手柄
         painter.setPen(QPen(Qt.GlobalColor.white, 1.5))
         painter.setBrush(QBrush(self.main_color))
-        
         corners = [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()]
         for corner in corners:
             painter.drawEllipse(corner, self.handle_radius, self.handle_radius)
@@ -366,6 +409,7 @@ class CropOverlay(QWidget):
     
     def mouseReleaseEvent(self, event):
         self.dragging = self.resizing = False
+
 
 # -------------------------------------------------------------
 # RangeSliderTimeline 类
@@ -516,10 +560,20 @@ class FrameAccuratePlayer:
             bytes_per_line = ch * w
             qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             pixmap = QPixmap.fromImage(qt_image)
-            scaled_pixmap = pixmap.scaled(self.video_widget.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            
+            # 关键修复：渲染前强制获取 video_widget 此时此刻的真实尺寸
+            target_size = self.video_widget.size()
+            if target_size.width() < 10 or target_size.height() < 10:
+                # 如果尺寸异常（未布局完成），暂时按 800x600 比例计算
+                target_size = self.video_widget.parentWidget().size()
+
+            scaled_pixmap = pixmap.scaled(
+                target_size, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
             self.video_widget.setPixmap(scaled_pixmap)
             
-            # 触发外部通知
             if self.on_position_changed:
                 self.on_position_changed(frame_index / self.fps if self.fps > 0 else 0)
             return True
@@ -938,7 +992,7 @@ class ClipExportThread(QThread):
             
             # 视频编码参数（顺序清晰，无歧义）
             cmd.extend([
-                '-c:v', 'h264_mf',
+                '-c:v', 'libx264',
                 '-b:v', '2M',  # 使用比特率控制（2Mbps）
                 '-pix_fmt', 'yuv420p',
                 self.output_path
@@ -1007,13 +1061,10 @@ class VideoComparisonWidget(QWidget):
     
     功能：
     - 左右分屏显示参考视频和用户视频
-    - 提供共用的播放控制面板
-    - 支持逐帧精确控制和进度条拖动
+    - 复用主界面的统一播放控制模块
+    - 支持逐帧精确控制
     - 单侧激活机制（蓝色边框高亮）
     """
-    
-    # 定义返回主界面的信号
-    return_to_main = Signal()
     
     def __init__(self, ref_paths, user_paths, parent=None):
         super().__init__(parent)
@@ -1028,8 +1079,10 @@ class VideoComparisonWidget(QWidget):
         
         # 定时器用于播放
         self.play_timer = QTimer()
+        self.play_timer.setInterval(100)
         self.play_timer.timeout.connect(self.on_play_timer)
         self.is_playing = False
+        self.playback_speed = 0.25
         
         # 构建UI
         self.build_ui()
@@ -1043,28 +1096,14 @@ class VideoComparisonWidget(QWidget):
     def build_ui(self):
         """构建对比界面UI"""
         main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(5)
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        
-        # ===== 1. 顶部栏 =====
-        top_bar = QHBoxLayout()
-        
-        btn_return = QPushButton("← 返回主界面")
-        btn_return.clicked.connect(self.return_to_main.emit)
-        btn_return.setStyleSheet("font-weight: bold; padding: 5px 15px;")
-        top_bar.addWidget(btn_return)
-        
-        top_bar.addStretch()
-        
-        title_label = QLabel("视频逐帧对比工具")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        top_bar.addWidget(title_label)
-        
-        top_bar.addStretch()
-        
-        main_layout.addLayout(top_bar)
-        
-        # ===== 2. 视频显示区域（左右分屏） =====
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        title_label = QLabel("视频逐帧对比")
+        title_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #1F2D3D;")
+        main_layout.addWidget(title_label)
+
+        # ===== 1. 视频显示区域（左右分屏） =====
         video_splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # 左侧视频区域
@@ -1088,8 +1127,8 @@ class VideoComparisonWidget(QWidget):
         video_splitter.setStretchFactor(1, 1)
         
         main_layout.addWidget(video_splitter, stretch=1)
-        
-        # ===== 3. 视频选择区域 =====
+
+        # ===== 2. 视频选择区域 =====
         selection_layout = QHBoxLayout()
         
         selection_layout.addWidget(QLabel("选择参考视频:"))
@@ -1109,54 +1148,11 @@ class VideoComparisonWidget(QWidget):
         selection_layout.addWidget(self.user_combo, stretch=1)
         
         main_layout.addLayout(selection_layout)
-        
-        # ===== 4. 共用控制面板 =====
-        control_group = QGroupBox("播放控制（控制当前激活的视频）")
-        control_layout = QVBoxLayout(control_group)
-        
-        # 4.1 按钮行
-        button_row = QHBoxLayout()
-        
-        self.btn_prev_frame = QPushButton("◀ 上一帧")
-        self.btn_prev_frame.clicked.connect(self.on_prev_frame)
-        button_row.addWidget(self.btn_prev_frame)
-        
-        self.btn_next_frame = QPushButton("▶ 下一帧")
-        self.btn_next_frame.clicked.connect(self.on_next_frame)
-        button_row.addWidget(self.btn_next_frame)
-        
-        self.btn_play_pause = QPushButton("▶ 播放")
-        self.btn_play_pause.clicked.connect(self.on_play_pause)
-        self.btn_play_pause.setStyleSheet("font-weight: bold;")
-        button_row.addWidget(self.btn_play_pause)
-        
-        button_row.addWidget(QLabel("速度:"))
-        self.speed_combo = QComboBox()
-        self.speed_combo.addItems(["0.1x", "0.25x", "0.5x", "1.0x"])
-        self.speed_combo.setCurrentText("0.25x")
-        button_row.addWidget(self.speed_combo)
-        
-        button_row.addStretch()
-        
-        control_layout.addLayout(button_row)
-        
-        # 4.2 进度条
-        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
-        self.progress_slider.setMinimum(0)
-        self.progress_slider.setMaximum(1000)
-        self.progress_slider.setValue(0)
-        self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
-        self.progress_slider.sliderMoved.connect(self.on_slider_moved)
-        self.progress_slider.sliderReleased.connect(self.on_slider_released)
-        control_layout.addWidget(self.progress_slider)
-        
-        # 4.3 信息显示
-        self.info_label = QLabel("当前: 0 / 0 帧    0.00s / 0.00s")
-        self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.info_label.setStyleSheet("font-size: 12px; color: #2C3E50;")
-        control_layout.addWidget(self.info_label)
-        
-        main_layout.addWidget(control_group)
+
+    def notify_host(self):
+        parent = self.parent()
+        if parent and hasattr(parent, "update_unified_playback_ui"):
+            parent.update_unified_playback_ui()
     
     def load_video(self, player_index, video_path):
         """加载视频到指定播放器"""
@@ -1177,12 +1173,9 @@ class VideoComparisonWidget(QWidget):
         if total_frames:
             self.players[player_index] = player
             print(f"[对比工具] 加载视频到播放器{player_index}: {os.path.basename(video_path)}")
-            
-            # 如果是激活的播放器，更新信息显示
-            if player_index == self.active_index:
-                self.update_info_display()
         else:
             video_label.setText(f"加载失败: {os.path.basename(video_path)}")
+        self.notify_host()
     
     def on_video_selected(self, player_index, combo_index):
         """下拉框选择视频时的回调"""
@@ -1191,6 +1184,7 @@ class VideoComparisonWidget(QWidget):
         
         if video_path:
             self.load_video(player_index, video_path)
+            self.notify_host()
     
     def switch_active_player(self, index):
         """切换激活的播放器"""
@@ -1206,7 +1200,7 @@ class VideoComparisonWidget(QWidget):
         
         # 更新UI
         self.update_border_highlight()
-        self.update_info_display()
+        self.notify_host()
         
         print(f"[对比工具] 切换到播放器{index}")
     
@@ -1231,35 +1225,15 @@ class VideoComparisonWidget(QWidget):
     def update_info_display(self):
         """更新信息显示"""
         player = self.get_active_player()
-        
         if not player:
-            self.info_label.setText("当前: 0 / 0 帧    0.00s / 0.00s")
-            self.progress_slider.setMaximum(1000)
-            self.progress_slider.setValue(0)
-            return
-        
-        info = player.get_current_frame_info()
-        if info:
-            frame_idx = info['frame_index']
-            total_frames = info['total_frames']
-            time_sec = info['time_seconds']
-            total_time = total_frames / info['fps'] if info['fps'] > 0 else 0
-            
-            self.info_label.setText(
-                f"当前: {frame_idx} / {total_frames} 帧    "
-                f"{time_sec:.2f}s / {total_time:.2f}s"
-            )
-            
-            # 更新进度条（不触发信号）
-            if total_frames > 0:
-                self.progress_slider.blockSignals(True)
-                self.progress_slider.setMaximum(total_frames - 1)
-                self.progress_slider.setValue(frame_idx)
-                self.progress_slider.blockSignals(False)
+            return None
+
+        return player.get_current_frame_info()
     
     def on_player_position_changed(self, time_seconds):
         """播放器位置变化回调"""
         self.update_info_display()
+        self.notify_host()
     
     # ===== 控制按钮槽函数 =====
     
@@ -1268,12 +1242,14 @@ class VideoComparisonWidget(QWidget):
         player = self.get_active_player()
         if player:
             player.prev_frame()
+        self.notify_host()
     
     def on_next_frame(self):
         """下一帧"""
         player = self.get_active_player()
         if player:
             player.next_frame()
+        self.notify_host()
     
     def on_play_pause(self):
         """播放/暂停切换"""
@@ -1282,21 +1258,19 @@ class VideoComparisonWidget(QWidget):
         else:
             self.start_playback()
     
-    def start_playback(self):
+    def start_playback(self, speed=None):
         """开始播放"""
         player = self.get_active_player()
         if not player:
             return
-        
-        # 获取速度
-        speed_text = self.speed_combo.currentText()
-        speed_map = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5, "1.0x": 1.0}
-        speed = speed_map.get(speed_text, 1.0)
-        
-        # 启动播放
-        player.play(speed)
+
+        if speed is not None:
+            self.playback_speed = speed
+
+        player.play(self.playback_speed)
         self.is_playing = True
-        self.btn_play_pause.setText("⏸ 暂停")
+        self.play_timer.start()
+        self.notify_host()
     
     def stop_playback(self):
         """停止播放"""
@@ -1305,7 +1279,8 @@ class VideoComparisonWidget(QWidget):
             player.pause()
         
         self.is_playing = False
-        self.btn_play_pause.setText("▶ 播放")
+        self.play_timer.stop()
+        self.notify_host()
     
     def on_play_timer(self):
         """播放定时器（用于检测播放结束）"""
@@ -1317,6 +1292,7 @@ class VideoComparisonWidget(QWidget):
         if info and info['frame_index'] >= info['total_frames'] - 1:
             # 播放到末尾，自动停止
             self.stop_playback()
+        self.notify_host()
     
     # ===== 进度条槽函数 =====
     
@@ -1330,6 +1306,7 @@ class VideoComparisonWidget(QWidget):
         player = self.get_active_player()
         if player:
             player.show_frame(value)
+        self.notify_host()
     
     def on_slider_released(self):
         """进度条释放"""
@@ -1345,8 +1322,56 @@ class VideoComparisonWidget(QWidget):
         
         event.accept()
 
+    def refresh_video_lists(self, ref_paths, user_paths):
+        """同步主界面导入的视频列表。"""
+        self.ref_paths = ref_paths
+        self.user_paths = user_paths
 
-# 动作片段剪辑器窗口
+        self.ref_combo.blockSignals(True)
+        self.user_combo.blockSignals(True)
+
+        current_ref = self.ref_combo.currentData()
+        current_user = self.user_combo.currentData()
+
+        self.ref_combo.clear()
+        for i, path in enumerate(self.ref_paths):
+            self.ref_combo.addItem(f"{i+1}. {os.path.basename(path)}", path)
+
+        self.user_combo.clear()
+        for i, path in enumerate(self.user_paths):
+            self.user_combo.addItem(f"{i+1}. {os.path.basename(path)}", path)
+
+        self.ref_combo.blockSignals(False)
+        self.user_combo.blockSignals(False)
+
+        if self.ref_paths:
+            ref_index = max(0, self.ref_combo.findData(current_ref))
+            self.ref_combo.setCurrentIndex(ref_index)
+            self.load_video(0, self.ref_combo.currentData())
+        else:
+            self.players[0] = None
+            self.left_video_label.setText("参考视频区域")
+
+        if self.user_paths:
+            user_index = max(0, self.user_combo.findData(current_user))
+            self.user_combo.setCurrentIndex(user_index)
+            self.load_video(1, self.user_combo.currentData())
+        else:
+            self.players[1] = None
+            self.right_video_label.setText("用户视频区域")
+
+        self.update_border_highlight()
+        self.notify_host()
+
+    def seek_active_player(self, frame_index):
+        player = self.get_active_player()
+        if player:
+            player.show_frame(frame_index)
+
+    def get_active_media_info(self):
+        return self.update_info_display()
+
+
 class ClipEditorWindow(QDialog):
     """动作片段剪辑器独立窗口"""
     
@@ -1363,15 +1388,16 @@ class ClipEditorWindow(QDialog):
         self.hit_before_after_ratio = 3.0  # 默认击球前:后 = 3:1
         
         self.export_thread = None
+        # 新增：用于精准记录当前导出的文件路径，防止导入时字符串解析出错
+        self.current_export_path = None 
         
         self.build_ui()
     
-    # 优化剪辑器 UI 布局（横向并排）
     def build_ui(self):
         """构建优化后的剪辑器UI布局"""
         main_layout = QVBoxLayout(self)
         
-        # 1. 顶部：视频预览（占据最大空间）
+        # 1. 顶部：视频预览
         preview_container = QWidget()
         preview_container.setStyleSheet("background-color: #1a1a1a; border-radius: 5px;")
         preview_layout = QVBoxLayout(preview_container)
@@ -1397,7 +1423,6 @@ class ClipEditorWindow(QDialog):
         
         # 3. 控制按钮行
         ctrl_bar = QHBoxLayout()
-        # 文件操作
         btn_load = QPushButton("📁 加载视频")
         btn_load.clicked.connect(self.load_video)
         btn_load.setStyleSheet("padding: 5px 15px; font-weight: bold;")
@@ -1405,7 +1430,6 @@ class ClipEditorWindow(QDialog):
         
         ctrl_bar.addSpacing(20)
         
-        # 播放控制
         self.btn_play = QPushButton("▶ 播放")
         self.btn_play.clicked.connect(self.play_video)
         ctrl_bar.addWidget(self.btn_play)
@@ -1428,13 +1452,10 @@ class ClipEditorWindow(QDialog):
         self.file_label = QLabel("未选择视频")
         self.file_label.setStyleSheet("color: #888;")
         ctrl_bar.addWidget(self.file_label)
-        
         main_layout.addLayout(ctrl_bar)
 
-        # 4. 设置区域（横向并排两个 GroupBox）
+        # 4. 设置区域
         settings_layout = QHBoxLayout()
-        
-        # --- 时间段设置 ---
         time_group = QGroupBox("⏱ 时间段定义")
         time_inner = QVBoxLayout(time_group)
         
@@ -1466,33 +1487,27 @@ class ClipEditorWindow(QDialog):
         self.end_label.setStyleSheet("color: #2ECC71; font-weight: bold;")
         h_ratio.addWidget(self.end_label, 1)
         time_inner.addLayout(h_ratio)
-        
         settings_layout.addWidget(time_group, 2)
         
-        # --- 裁剪设置 ---
         crop_group = QGroupBox("🖼 画面裁剪")
         crop_inner = QVBoxLayout(crop_group)
-        
         h_crop_opt = QHBoxLayout()
         h_crop_opt.addWidget(QLabel("比例:"))
         self.crop_ratio_combo = QComboBox()
-        self.crop_ratio_combo.addItems(["16:9 (横屏)", "9:16 (竖屏)", "2:3", "3:2", "1:1"])
+        self.crop_ratio_combo.addItems(["2:3 (竖屏)", "16:9 (横屏)", "原始比例"])
+        self.crop_ratio_combo.setCurrentIndex(0)
         self.crop_ratio_combo.currentTextChanged.connect(self.change_crop_ratio)
         h_crop_opt.addWidget(self.crop_ratio_combo)
-        
         self.crop_enable_check = QCheckBox("开启裁剪框")
         self.crop_enable_check.stateChanged.connect(self.toggle_crop_overlay)
         h_crop_opt.addWidget(self.crop_enable_check)
         crop_inner.addLayout(h_crop_opt)
-        
         crop_inner.addStretch()
         btn_export = QPushButton("💾 导出片段（帧精确）")
         btn_export.clicked.connect(self.export_clip)
         btn_export.setStyleSheet("background-color: #3498DB; color: white; font-weight: bold; padding: 10px;")
         crop_inner.addWidget(btn_export)
-        
         settings_layout.addWidget(crop_group, 1)
-        
         main_layout.addLayout(settings_layout)
         
         # 5. 底部状态
@@ -1503,159 +1518,99 @@ class ClipEditorWindow(QDialog):
         self.status_label = QLabel("就绪")
         footer.addWidget(self.status_label)
         main_layout.addLayout(footer)
-    
+
     def load_video(self):
-        """加载视频文件"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择视频文件", "", "Video (*.mp4 *.mov *.mkv *.avi)"
-        )
-        if not path:
-            return
-        
+        """加载视频文件并初始化"""
+        path, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", "Video (*.mp4 *.mov *.mkv *.avi)")
+        if not path: return
         self.video_path = path
         self.file_label.setText(os.path.basename(path))
-        
-        # 初始化帧播放器
-        if self.frame_player:
-            self.frame_player.release()
-        
+        if self.frame_player: self.frame_player.release()
         self.frame_player = FrameAccuratePlayer(self.video_label)
-        # 设置播放器回调，同步时间轴
         self.frame_player.on_position_changed = self.on_player_time_update
         total_frames, fps = self.frame_player.load_video(path)
-        
         if total_frames:
+            QApplication.processEvents()
+            try:
+                clip = VideoFileClip(path)
+                self.crop_overlay.original_ratio = clip.w / clip.h
+                clip.close()
+            except: pass
+            self.frame_player.show_frame(0)
+            display_rect = self.update_crop_overlay_geometry()
             duration = total_frames / fps
             self.timeline.set_duration(duration)
             self.timeline.set_times(0, duration, 0)
-            self.status_label.setText(
-                f"视频已加载 | 总帧数: {total_frames} | FPS: {fps:.2f}"
-            )
-            
-            # 更新裁剪框的视频显示区域
-            self.update_crop_overlay_geometry()
+            current_ratio_text = self.crop_ratio_combo.currentText()
+            self.crop_overlay.set_aspect_ratio(current_ratio_text)
+            if not display_rect.isEmpty():
+                self.crop_overlay.crop_rect.moveCenter(display_rect.center())
+            self.status_label.setText(f"视频已加载 | 总帧数: {total_frames} | FPS: {fps:.2f}")
+            self.update()
         else:
             self.status_label.setText("视频加载失败")
-    
-    # 时间轴交互槽函数
+
     def on_timeline_seek(self, t):
-        """处理时间轴播放头拖动"""
         if self.frame_player:
             frame = int(t * self.frame_player.fps)
             self.frame_player.show_frame(frame)
             self.update_frame_info()
 
     def on_timeline_start_changed(self, t):
-        """处理时间轴开始端点拖动"""
         self.start_time = t
         self.start_label.setText(f"{t:.3f}s")
         self.calculate_end_time()
     
     def on_timeline_hit_changed(self, t):
-        """处理时间轴击球端点拖动"""
         self.hit_time = t
         self.hit_label.setText(f"{t:.3f}s")
         self.calculate_end_time()
 
-    def on_timeline_range_changed(self, start, end):
-        """时间轴拖动端点，同步文字标签"""
-        self.start_time = start
-        self.end_time = end
-        # 更新文字显示
-        self.start_label.setText(f"{self.start_time:.3f}秒")
-        self.end_label.setText(f"{self.end_time:.3f}秒 (手动调节)")
-        # 重新标记开始时刻颜色
-        self.start_label.setStyleSheet("font-weight: bold; color: #2ECC71;")
-        self.update()
-
     def on_player_time_update(self, t):
-        """视频播放时更新时间轴进度（重写此方法以防覆盖端点）"""
         self.timeline.current_time = t
         self.timeline.update()
 
     def update_crop_overlay_geometry(self):
-        """更新裁剪框覆盖层的几何位置"""
-        if not self.frame_player:
-            return
-        
-        # 获取视频标签的几何信息
+        if not self.frame_player: return QRect()
         label_rect = self.video_label.geometry()
-        
-        # 获取实际显示的视频区域（考虑KeepAspectRatio）
+        self.crop_overlay.setGeometry(label_rect)
         pixmap = self.video_label.pixmap()
         if pixmap:
-            pixmap_size = pixmap.size()
-            label_size = self.video_label.size()
-            
-            # 计算视频在标签中的实际显示区域
-            scale = min(label_size.width() / pixmap_size.width(),
-                       label_size.height() / pixmap_size.height())
-            
-            display_width = int(pixmap_size.width() * scale)
-            display_height = int(pixmap_size.height() * scale)
-            
-            display_x = label_rect.x() + (label_size.width() - display_width) // 2
-            display_y = label_rect.y() + (label_size.height() - display_height) // 2
-            
-            video_display_rect = QRect(display_x, display_y, display_width, display_height)
+            pixmap_size, label_size = pixmap.size(), self.video_label.size()
+            scale = min(label_size.width() / pixmap_size.width(), label_size.height() / pixmap_size.height())
+            display_width, display_height = int(pixmap_size.width() * scale), int(pixmap_size.height() * scale)
+            local_x, local_y = (label_size.width() - display_width) // 2, (label_size.height() - display_height) // 2
+            video_display_rect = QRect(local_x, local_y, display_width, display_height)
             self.crop_overlay.set_video_display_rect(video_display_rect)
-        
-        # 设置覆盖层大小与视频标签一致
-        self.crop_overlay.setGeometry(label_rect)
-    
+            return video_display_rect
+        return QRect()
+
     def resizeEvent(self, event):
-        """窗口大小改变时更新裁剪框"""
         super().resizeEvent(event)
         self.update_crop_overlay_geometry()
-    
+
     def play_video(self):
-        """播放视频"""
-        if not self.frame_player:
-            return
-        
-        speed_map = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5, "1.0x": 1.0}
-        speed = speed_map.get(self.speed_combo.currentText(), 0.25)
+        if not self.frame_player: return
+        speed = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5, "1.0x": 1.0}.get(self.speed_combo.currentText(), 0.25)
         self.frame_player.play(speed)
-        self.status_label.setText(f"正在播放 ({self.speed_combo.currentText()})")
     
     def pause_video(self):
-        """暂停视频"""
-        if self.frame_player:
-            self.frame_player.pause()
-            frame_info = self.frame_player.get_current_frame_info()
-            if frame_info:
-                self.status_label.setText(
-                    f"已暂停 | 第{frame_info['frame_index']}帧 ({frame_info['time_seconds']:.3f}秒)"
-                )
+        if self.frame_player: self.frame_player.pause()
     
     def prev_frame(self):
-        """上一帧"""
-        if self.frame_player:
-            self.frame_player.prev_frame()
-            self.update_frame_info()
+        if self.frame_player: self.frame_player.prev_frame(); self.update_frame_info()
     
     def next_frame(self):
-        """下一帧"""
-        if self.frame_player:
-            self.frame_player.next_frame()
-            self.update_frame_info()
-    
+        if self.frame_player: self.frame_player.next_frame(); self.update_frame_info()
+
     def update_frame_info(self):
-        """更新帧信息显示"""
         if self.frame_player:
-            frame_info = self.frame_player.get_current_frame_info()
-            if frame_info:
-                self.status_label.setText(
-                    f"第{frame_info['frame_index']}帧 ({frame_info['time_seconds']:.3f}秒)"
-                )
-    
+            info = self.frame_player.get_current_frame_info()
+            if info: self.status_label.setText(f"第{info['frame_index']}帧 ({info['time_seconds']:.3f}秒)")
+
     def change_speed(self):
-        """改变播放速度"""
-        if self.frame_player and self.frame_player.is_playing:
-            speed_map = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5, "1.0x": 1.0}
-            speed = speed_map.get(self.speed_combo.currentText(), 0.25)
-            self.frame_player.play(speed)
-    
+        if self.frame_player and self.frame_player.is_playing: self.play_video()
+
     def set_start_time(self):
         if self.frame_player:
             info = self.frame_player.get_current_frame_info()
@@ -1674,208 +1629,83 @@ class ClipEditorWindow(QDialog):
                 self.timeline.set_times(self.start_time, self.hit_time, self.hit_time)
                 self.calculate_end_time()
 
-    def update_ratio(self):
-        """更新前后比例"""
-        try:
-            self.hit_before_after_ratio = float(self.ratio_input.text())
-            self.calculate_end_time()
-        except:
-            pass
-
     def calculate_end_time(self):
-        """根据开始时刻、击球时刻和比例自动计算结束时刻"""
-        if self.hit_time is None:
-            self.end_label.setText("请先设置击球时刻")
-            return
-        
+        if self.hit_time is None: return
         before_duration = self.hit_time - self.start_time
-        if before_duration < 0:
-            self.end_label.setText("开始时刻晚于击球时刻!")
-            return
-        
+        if before_duration < 0: return
         after_duration = before_duration / self.hit_before_after_ratio
         self.end_time = self.hit_time + after_duration
-        
-        # 检查是否超出视频长度
         if self.frame_player:
-            frame_info = self.frame_player.get_current_frame_info()
-            max_time = frame_info['total_frames'] / frame_info['fps']
-            if self.end_time > max_time:
-                self.end_time = max_time
-        
-        self.end_label.setText(f"{self.end_time:.3f}秒 (自动计算)")
-        self.status_label.setText(
-            f"片段时长: {self.end_time - self.start_time:.2f}秒 | "
-            f"前{before_duration:.2f}秒 / 后{after_duration:.2f}秒"
-        )
-
+            max_t = self.frame_player.total_frames / self.frame_player.fps
+            if self.end_time > max_t: self.end_time = max_t
+        self.end_label.setText(f"{self.end_time:.3f}s")
         self.timeline.set_times(self.start_time, self.end_time, self.timeline.current_time, self.hit_time)
 
-    def change_crop_ratio(self, ratio_text):
-        """改变裁剪比例"""
-        if self.crop_overlay.isVisible():
-            self.crop_overlay.set_aspect_ratio(ratio_text)
+    def change_crop_ratio(self, text):
+        self.crop_overlay.set_aspect_ratio(text)
 
     def toggle_crop_overlay(self, state):
-        """切换裁剪框显示"""
         if state == Qt.CheckState.Checked.value:
             self.crop_overlay.show()
             self.update_crop_overlay_geometry()
-        else:
-            self.crop_overlay.hide()
-
-    def preview_clip(self):
-        """预览片段（使用VLC播放临时片段）"""
-        if not self.validate_clip_params():
-            return
-        
-        # 使用MoviePy快速生成预览（不导出文件，直接在内存中）
-        # 为简化，这里暂时提示用户直接导出后查看
-        QMessageBox.information(
-            self,
-            "预览提示",
-            "预览功能将在后续版本中完善。\n建议直接导出查看效果。"
-        )
+        else: self.crop_overlay.hide()
 
     def validate_clip_params(self):
-        """验证剪辑参数"""
-        if not self.frame_player:
-            self.status_label.setText("请先加载视频")
-            return False
-        
-        if self.hit_time is None or self.end_time is None:
-            self.status_label.setText("请设置完整的时间点")
-            return False
-        
-        if self.end_time <= self.start_time:
-            self.status_label.setText("结束时刻必须晚于开始时刻")
-            return False
-        
-        return True
+        if not self.frame_player: return False
+        if self.hit_time is None or self.end_time is None: return False
+        return self.end_time > self.start_time
 
-    # 导出片段方法（传递帧参数）
     def export_clip(self):
-        """
-        导出片段
+        """导出片段"""
+        if not self.validate_clip_params(): return
+        if not check_ffmpeg_available(): return
         
-        修改说明：
-        - 改为传递精确的帧号（start_frame, end_frame）而非时间
-        - 从FrameAccuratePlayer获取帧率信息
-        - 使用FFmpeg进行帧精确裁剪
-        """
-        if not self.validate_clip_params():
-            return
-        
-        # 检查FFmpeg是否可用
-        if not check_ffmpeg_available():
-            QMessageBox.critical(
-                self,
-                "缺少依赖",
-                "系统未检测到FFmpeg。\n\n"
-                "请先安装FFmpeg：\n"
-                "- Windows: 从 https://ffmpeg.org 下载并添加到PATH\n"
-                "- macOS: brew install ffmpeg\n"
-                "- Linux: sudo apt install ffmpeg"
-            )
-            return
-        
-        # 选择保存路径
         default_name = f"{os.path.splitext(os.path.basename(self.video_path))[0]}_clip.mp4"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "保存片段", default_name, "MP4 文件 (*.mp4)"
-        )
-        if not save_path:
-            return
+        save_path, _ = QFileDialog.getSaveFileName(self, "保存片段", default_name, "MP4 文件 (*.mp4)")
+        if not save_path: return
         
-        # 获取帧率和帧号
-        if not self.frame_player:
-            self.status_label.setText("错误：帧播放器未初始化")
-            return
+        # 关键修复：在这里记录纯净的导出路径
+        self.current_export_path = save_path
         
         fps = self.frame_player.fps
+        start_frame, end_frame = int(self.start_time * fps), int(self.end_time * fps)
         
-        # 将时间转换为精确的帧号
-        start_frame = int(self.start_time * fps)
-        end_frame = int(self.end_time * fps)
-        
-        # 获取裁剪参数
         if self.crop_enable_check.isChecked():
-            # 获取原始视频尺寸
             clip_test = VideoFileClip(self.video_path)
             video_size = clip_test.size
             clip_test.close()
-            
             crop_params = self.crop_overlay.get_crop_params(video_size)
-        else:
-            # 不裁剪（传递0表示不裁剪）
-            crop_params = (0, 0, 0, 0)
+        else: crop_params = (0, 0, 0, 0)
         
-        # 启动导出线程（传递帧号和帧率）
-        self.export_thread = ClipExportThread(
-            self.video_path,
-            start_frame,      # 传递帧号
-            end_frame,        # 传递帧号
-            fps,              # 传递帧率
-            crop_params,
-            save_path
-        )
-        
+        self.export_thread = ClipExportThread(self.video_path, start_frame, end_frame, fps, crop_params, save_path)
         self.export_thread.progress_updated.connect(self.on_export_progress)
         self.export_thread.status_updated.connect(self.on_export_status)
         self.export_thread.finished_signal.connect(self.on_export_finished)
-        
         self.export_thread.start()
 
-    def on_export_progress(self, percent):
-        """导出进度更新"""
-        self.progress_bar.setValue(percent)
-
-    def on_export_status(self, status):
-        """导出状态更新"""
-        self.status_label.setText(status)
+    def on_export_progress(self, percent): self.progress_bar.setValue(percent)
+    def on_export_status(self, status): self.status_label.setText(status)
 
     def on_export_finished(self, success, message):
-        """导出完成"""
+        """导出完成处理"""
         self.status_label.setText(message)
-        
         if success:
             self.progress_bar.setValue(100)
-            
-            # 询问是否导入到主界面
-            reply = QMessageBox.question(
-                self,
-                "导出成功",
-                f"{message}\n\n是否将片段导入到主界面？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            
+            reply = QMessageBox.question(self, "导出成功", f"导出成功！\n\n是否将该片段导入到主界面对比列表？",
+                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                # 获取保存路径
-                output_path = message.split(": ")[-1]
+                # 关键修复：直接使用精准记录的路径变量，彻底解决解析失败问题
+                output_path = self.current_export_path
                 
-                # 询问导入位置
-                import_reply = QMessageBox.question(
-                    self,
-                    "选择导入位置",
-                    "导入到参考列表？\n(选择'No'将导入到用户列表)",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                
+                import_reply = QMessageBox.question(self, "选择导入位置", "导入到参考列表？\n(选择'No'将导入到用户列表)",
+                                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                 is_ref = (import_reply == QMessageBox.StandardButton.Yes)
-                
-                # 通过父窗口导入（需要在MainWindow中添加对应方法）
-                if self.parent():
-                    self.parent().import_clip_from_editor(output_path, is_ref)
-                
-                # 关闭剪辑器窗口
+                if self.parent(): self.parent().import_clip_from_editor(output_path, is_ref)
                 self.accept()
-        else:
-            self.progress_bar.setValue(0)
+        else: self.progress_bar.setValue(0)
 
     def closeEvent(self, event):
-        """关闭事件"""
-        if self.frame_player:
-            self.frame_player.release()
+        if self.frame_player: self.frame_player.release()
         event.accept()
 
 
@@ -1931,30 +1761,28 @@ class MainWindow(QWidget):
         # 程序启动时自动尝试导入测试视频
         self.auto_load_test_videos()
 
-        # 检查FFmpeg是否可用（非阻塞提示）
-        if not check_ffmpeg_available():
+        missing_dependencies = get_missing_runtime_dependencies()
+        if missing_dependencies:
             self.status_label.setText(
-                "⚠ 警告：未检测到FFmpeg，剪辑器功能将不可用。"
-                "请安装FFmpeg以使用完整功能。"
+                "⚠ 警告：缺少运行依赖 "
+                + ", ".join(missing_dependencies)
+                + "，部分功能将不可用。请按 readme 安装 Ubuntu 依赖。"
             )
+        self.update_unified_playback_ui()
 
     # -------------------------------------------------------------
     #   VLC 播放组件初始化
     # -------------------------------------------------------------
     def build_vlc(self):
-        self.vlc_instance = vlc.Instance()
+        self.vlc_instance = vlc.Instance("--no-video-title-show")
         self.vlc_player = self.vlc_instance.media_player_new()
 
         # -------------------------------------------------------------
-        # PySide6 的 winId() 返回的是对象，必须强制转换为 int
-        # -------------------------------------------------------------
-        # 绑定 PySide6 窗口
-        if sys.platform.startswith("linux"):
-            self.vlc_player.set_xwindow(int(self.video_widget.winId()))
-        elif sys.platform == "win32":
-            self.vlc_player.set_hwnd(int(self.video_widget.winId()))
-        else:
-            self.vlc_player.set_nsobject(int(self.video_widget.winId()))
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("当前版本仅支持 Ubuntu 22.04 LTS。")
+
+        # PySide6 的 winId() 返回的是对象，必须强制转换为 int。
+        self.vlc_player.set_xwindow(int(self.video_widget.winId()))
 
         self.vlc_timer = QTimer(self)
         self.vlc_timer.setInterval(200)
@@ -2011,92 +1839,62 @@ class MainWindow(QWidget):
         # 3. 如果有视频导入，刷新下拉框
         if has_loaded:
             self.refresh_combo_box()
+            self.reset_speed_duration_defaults()
             # 自动选择第一个视频以便立即操作
             if self.manual_video_combo.count() > 0:
                 self.manual_video_combo.setCurrentIndex(0)
 
-    # 使用 QStackedWidget 实现界面切换
     def build_ui(self):
-        """构建主界面UI（使用 QStackedWidget 支持界面切换）"""
-        # 创建 QStackedWidget 作为主容器
-        self.stacked_widget = QStackedWidget()
-        
-        # ===== 页面0：主功能界面 =====
-        main_page = QWidget()
-        main_layout = QHBoxLayout(main_page)
-        
+        """构建主界面UI。"""
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+
         # --- 左侧控制区 ---
         left_panel = QVBoxLayout()
-        
+
         # 【模块1】动作片段导入模块
         self._build_video_import_module(left_panel)
-        
+
+        # 【模块2】对齐模式设置模块
+        self._build_alignment_mode_module(left_panel)
+
         # 【模块3】播放速度/时长设置模块
         self._build_speed_duration_module(left_panel)
-        
-        # 【模块4】对比视频播放控制模块
-        self._build_playback_control_module(left_panel)
-        
-        # 切换到对比模式按钮
-        btn_switch_to_comparison = QPushButton("🔄 切换到视频对比模式")
-        btn_switch_to_comparison.clicked.connect(self.switch_to_comparison_mode)
-        btn_switch_to_comparison.setStyleSheet("""
-            QPushButton {
-                background-color: #9B59B6;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #8E44AD;
-            }
-        """)
-        left_panel.addWidget(btn_switch_to_comparison)
-        
-        # 添加弹性空间
+
+        # 【模块4】生成/导出模块
+        self._build_generation_module(left_panel)
+
         left_panel.addStretch()
-        
+
         main_layout.addLayout(left_panel, stretch=1)
-        
+
         # --- 右侧区域 ---
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        
-        # 视频预览区域
+        right_panel = QVBoxLayout()
+
+        self.preview_tab_widget = QTabWidget()
+        self.preview_tab_widget.currentChanged.connect(self.on_display_tab_changed)
+
+        # 预览 Tab
+        preview_tab = QWidget()
+        preview_layout = QVBoxLayout(preview_tab)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+
         self.video_widget = QLabel("预览区域（由 VLC 渲染）")
         self.video_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_widget.setStyleSheet("background-color: black; color: gray;")
         self.video_widget.setMinimumHeight(300)
-        right_splitter.addWidget(self.video_widget)
-        
-        # 对齐模式设置容器
-        alignment_container = QWidget()
-        alignment_layout = QVBoxLayout(alignment_container)
-        alignment_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self._build_alignment_mode_module(alignment_layout)
-        alignment_layout.addStretch()
-        
-        right_splitter.addWidget(alignment_container)
-        
-        # 设置初始比例
-        right_splitter.setStretchFactor(0, 4)
-        right_splitter.setStretchFactor(1, 1)
-        
-        main_layout.addWidget(right_splitter, stretch=3)
-        
-        # 将主功能页面添加到 StackedWidget
-        self.stacked_widget.addWidget(main_page)
-        
-        # ===== 页面1：视频对比界面 =====
-        # 注意：实际的 VideoComparisonWidget 在 switch_to_comparison_mode 中创建
-        # 这里先添加一个占位符
-        self.comparison_widget = None
-        
-        # 将 StackedWidget 设置为主窗口的布局
-        window_layout = QVBoxLayout(self)
-        window_layout.setContentsMargins(0, 0, 0, 0)
-        window_layout.addWidget(self.stacked_widget)
+        preview_layout.addWidget(self.video_widget)
+        self.preview_tab_widget.addTab(preview_tab, "预览")
+
+        # 视频对比 Tab
+        self.comparison_widget = VideoComparisonWidget(self.ref_paths, self.user_paths, self)
+        self.preview_tab_widget.addTab(self.comparison_widget, "视频对比")
+
+        right_panel.addWidget(self.preview_tab_widget, stretch=1)
+        self._build_unified_playback_module(right_panel)
+
+        main_layout.addLayout(right_panel, stretch=4)
+        self.update_unified_playback_ui()
     
     def _build_video_import_module(self, parent_layout):
         """【模块1】构建动作片段导入模块"""
@@ -2271,48 +2069,9 @@ class MainWindow(QWidget):
         h_hit_vid.addWidget(self.hit_video_combo, stretch=1)
         hit_layout.addLayout(h_hit_vid)
         
-        # 控制与操作行 (播放控制 + 设为击球点 放在同一行)
+        # 操作行
         h_ctrl = QHBoxLayout()
-        
-        # 播放/暂停 (使用短文本或图标)
-        self.btn_play_for_hit = QPushButton("▶")
-        self.btn_play_for_hit.setToolTip("播放")
-        self.btn_play_for_hit.setFixedWidth(40)
-        self.btn_play_for_hit.clicked.connect(self.play_single_video_for_hit_moment)
-        h_ctrl.addWidget(self.btn_play_for_hit)
-        
-        self.btn_pause_for_hit = QPushButton("⏸")
-        self.btn_pause_for_hit.setToolTip("暂停")
-        self.btn_pause_for_hit.setFixedWidth(40)
-        self.btn_pause_for_hit.clicked.connect(self.pause_for_hit_moment)
-        h_ctrl.addWidget(self.btn_pause_for_hit)
 
-        # 添加逐帧控制按钮（开始） 
-        # 上一帧按钮
-        self.btn_prev_frame = QPushButton("◀")
-        self.btn_prev_frame.setToolTip("上一帧")
-        self.btn_prev_frame.setFixedWidth(40)
-        self.btn_prev_frame.clicked.connect(self.prev_frame_for_hit)
-        h_ctrl.addWidget(self.btn_prev_frame)
-        
-        # 下一帧按钮
-        self.btn_next_frame = QPushButton("▶")
-        self.btn_next_frame.setToolTip("下一帧")
-        self.btn_next_frame.setFixedWidth(40)
-        self.btn_next_frame.clicked.connect(self.next_frame_for_hit)
-        h_ctrl.addWidget(self.btn_next_frame)
-        
-        # 速度
-        h_ctrl.addWidget(QLabel("速:"))
-        self.hit_playback_speed = QComboBox()
-        self.hit_playback_speed.addItems(["0.1x", "0.25x", "0.5x", "0.75x", "1.0x"])
-        self.hit_playback_speed.setCurrentText("0.25x")
-        self.hit_playback_speed.setFixedWidth(60)
-        self.hit_playback_speed.currentTextChanged.connect(self.change_hit_playback_speed)
-        h_ctrl.addWidget(self.hit_playback_speed)
-        
-        h_ctrl.addSpacing(10)
-        
         # 设置按钮
         self.btn_set_hit_moment = QPushButton("📍 设为击球点")
         self.btn_set_hit_moment.clicked.connect(self.set_hit_moment)
@@ -2381,11 +2140,11 @@ class MainWindow(QWidget):
         
         parent_layout.addWidget(group_box)
     
-    def _build_playback_control_module(self, parent_layout):
-        """【模块4】构建对比视频播放控制模块"""
+    def _build_generation_module(self, parent_layout):
+        """【模块4】构建生成与导出模块。"""
         from PySide6.QtWidgets import QGroupBox
         
-        group_box = QGroupBox("🎬 对比视频播放控制")
+        group_box = QGroupBox("🎬 预览生成与导出")
         group_box.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
@@ -2403,40 +2162,86 @@ class MainWindow(QWidget):
         
         module_layout = QVBoxLayout(group_box)
         
-        # 循环播放开关
         self.loop_checkbox = QCheckBox("循环播放")
         module_layout.addWidget(self.loop_checkbox)
         
-        # 生成 & 预览
         btn_preview = QPushButton("▶ 生成并播放对比视频")
         btn_preview.clicked.connect(self.generate_preview)
         btn_preview.setStyleSheet("font-weight: bold; padding: 8px;")
         module_layout.addWidget(btn_preview)
-        
-        btn_stop = QPushButton("⏸ 暂停/继续播放")
-        btn_stop.clicked.connect(self.stop_preview)
-        module_layout.addWidget(btn_stop)
-        
-        module_layout.addSpacing(5)
-        
-        # 导出最终视频
+
         btn_export = QPushButton("💾 导出最终视频")
         btn_export.clicked.connect(self.export_final)
         btn_export.setStyleSheet("font-weight: bold; background-color: #3498DB; color: white; padding: 8px;")
         module_layout.addWidget(btn_export)
-        
-        module_layout.addSpacing(5)
-        
-        # 进度条
+
         self.progress = QProgressBar()
         module_layout.addWidget(self.progress)
-        
-        # 状态标签
+
         self.status_label = QLabel("状态：等待操作")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #2C3E50; font-size: 11px;")
         module_layout.addWidget(self.status_label)
         
+        parent_layout.addWidget(group_box)
+
+    def _build_unified_playback_module(self, parent_layout):
+        """构建主界面统一播放控制模块。"""
+        group_box = QGroupBox("▶ 统一播放控制")
+        group_box.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #9B59B6;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+
+        module_layout = QVBoxLayout(group_box)
+
+        button_row = QHBoxLayout()
+        self.unified_prev_button = QPushButton("◀ 上一帧")
+        self.unified_prev_button.clicked.connect(self.on_unified_prev_frame)
+        button_row.addWidget(self.unified_prev_button)
+
+        self.unified_next_button = QPushButton("▶ 下一帧")
+        self.unified_next_button.clicked.connect(self.on_unified_next_frame)
+        button_row.addWidget(self.unified_next_button)
+
+        self.unified_play_button = QPushButton("▶ 播放")
+        self.unified_play_button.clicked.connect(self.on_unified_play_pause)
+        self.unified_play_button.setStyleSheet("font-weight: bold;")
+        button_row.addWidget(self.unified_play_button)
+
+        button_row.addWidget(QLabel("速度:"))
+        self.unified_speed_combo = QComboBox()
+        self.unified_speed_combo.addItems(["0.1x", "0.25x", "0.5x", "1.0x"])
+        self.unified_speed_combo.setCurrentText("0.25x")
+        self.unified_speed_combo.currentTextChanged.connect(self.on_unified_speed_changed)
+        button_row.addWidget(self.unified_speed_combo)
+        button_row.addStretch()
+
+        module_layout.addLayout(button_row)
+
+        self.unified_progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.unified_progress_slider.setMinimum(0)
+        self.unified_progress_slider.setMaximum(1000)
+        self.unified_progress_slider.sliderPressed.connect(self.on_unified_slider_pressed)
+        self.unified_progress_slider.sliderMoved.connect(self.on_unified_slider_moved)
+        self.unified_progress_slider.sliderReleased.connect(self.on_unified_slider_released)
+        module_layout.addWidget(self.unified_progress_slider)
+
+        self.unified_info_label = QLabel("当前: 0 / 0    0.00s / 0.00s")
+        self.unified_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.unified_info_label.setStyleSheet("font-size: 12px; color: #2C3E50;")
+        module_layout.addWidget(self.unified_info_label)
+
         parent_layout.addWidget(group_box)
 
     def close_active_clips(self):
@@ -2491,6 +2296,25 @@ class MainWindow(QWidget):
             if self.hit_video_combo.currentIndex() < 0:
                 self.hit_video_combo.setCurrentIndex(0)
 
+        if self.comparison_widget:
+            self.comparison_widget.refresh_video_lists(self.ref_paths, self.user_paths)
+
+    def reset_speed_duration_defaults(self):
+        """将播放速度/时长恢复为基于原始视频的默认值。"""
+        self.speed_input.blockSignals(True)
+        self.duration_input.blockSignals(True)
+
+        self.speed_input.setText("1.0")
+
+        if self.all_video_paths:
+            max_raw = max(VideoFileClip(p).duration for p in self.all_video_paths)
+            self.duration_input.setText(f"{max_raw:.2f}")
+        else:
+            self.duration_input.clear()
+
+        self.speed_input.blockSignals(False)
+        self.duration_input.blockSignals(False)
+
     def import_ref_video(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择参考视频", "", "Video (*.mp4 *.mov *.mkv *.avi)")
         if paths:
@@ -2507,6 +2331,8 @@ class MainWindow(QWidget):
                 self.ref_list_widget.addItem(p)
                 self.video_settings[p] = {"trim_start": 0, "trim_end": 0}
             self.refresh_combo_box()
+            self.reset_speed_duration_defaults()
+            self.update_unified_playback_ui()
 
     def import_user_video(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择用户视频", "", "Video (*.mp4 *.mov *.mkv *.avi)")
@@ -2524,6 +2350,8 @@ class MainWindow(QWidget):
                 self.user_list_widget.addItem(p)
                 self.video_settings[p] = {"trim_start": 0, "trim_end": 0}
             self.refresh_combo_box()
+            self.reset_speed_duration_defaults()
+            self.update_unified_playback_ui()
 
     def remove_ref_video(self):
         row = self.ref_list_widget.currentRow()
@@ -2533,6 +2361,8 @@ class MainWindow(QWidget):
             if p in self.video_settings and p not in self.all_video_paths:
                 del self.video_settings[p]
             self.refresh_combo_box()
+            self.reset_speed_duration_defaults()
+            self.update_unified_playback_ui()
 
     def remove_user_video(self):
         row = self.user_list_widget.currentRow()
@@ -2542,6 +2372,8 @@ class MainWindow(QWidget):
             if p in self.video_settings and p not in self.all_video_paths:
                 del self.video_settings[p]
             self.refresh_combo_box()
+            self.reset_speed_duration_defaults()
+            self.update_unified_playback_ui()
 
     def sync_combo_selection(self, row, is_ref=True):
         """点击列表时，同步选中下拉框（同时更新两个下拉框）"""
@@ -2558,6 +2390,209 @@ class MainWindow(QWidget):
             self.manual_video_combo.setCurrentIndex(global_idx)
         if global_idx < self.hit_video_combo.count():
             self.hit_video_combo.setCurrentIndex(global_idx)
+
+    def current_display_mode(self):
+        """返回当前右侧播放区域模式。"""
+        return "comparison" if self.preview_tab_widget.currentIndex() == 1 else "preview"
+
+    def on_display_tab_changed(self, index):
+        """切换显示 Tab 时刷新统一控制模块。"""
+        if index == 1 and self.comparison_widget:
+            self.comparison_widget.refresh_video_lists(self.ref_paths, self.user_paths)
+        self.update_unified_playback_ui()
+
+    def get_unified_speed_value(self):
+        speed_map = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5, "1.0x": 1.0}
+        return speed_map.get(self.unified_speed_combo.currentText(), 0.25)
+
+    def has_vlc_player(self):
+        """统一判断 VLC 播放器是否已初始化。"""
+        return hasattr(self, "vlc_player") and self.vlc_player is not None
+
+    def has_unified_controls(self):
+        """统一判断主界面播放控制控件是否已创建完成。"""
+        return hasattr(self, "unified_progress_slider") and hasattr(self, "unified_info_label")
+
+    def on_unified_prev_frame(self):
+        if self.current_display_mode() == "comparison":
+            if self.comparison_widget:
+                self.comparison_widget.on_prev_frame()
+        elif self.is_using_frame_player and self.frame_player:
+            self.frame_player.prev_frame()
+        elif not self.has_vlc_player():
+            return
+        else:
+            self.seek_preview_by_offset(-1)
+        self.update_unified_playback_ui()
+
+    def on_unified_next_frame(self):
+        if self.current_display_mode() == "comparison":
+            if self.comparison_widget:
+                self.comparison_widget.on_next_frame()
+        elif self.is_using_frame_player and self.frame_player:
+            self.frame_player.next_frame()
+        elif not self.has_vlc_player():
+            return
+        else:
+            self.seek_preview_by_offset(1)
+        self.update_unified_playback_ui()
+
+    def on_unified_play_pause(self):
+        if self.current_display_mode() == "comparison":
+            if not self.comparison_widget:
+                return
+            self.comparison_widget.playback_speed = self.get_unified_speed_value()
+            self.comparison_widget.on_play_pause()
+        elif self.is_using_frame_player and self.frame_player:
+            if self.frame_player.is_playing:
+                self.frame_player.pause()
+            else:
+                self.frame_player.play(self.get_unified_speed_value())
+        elif not self.has_vlc_player():
+            return
+        else:
+            self.stop_preview()
+        self.update_unified_playback_ui()
+
+    def on_unified_speed_changed(self, speed_text):
+        speed = self.get_unified_speed_value()
+        if self.current_display_mode() == "comparison":
+            if self.comparison_widget:
+                self.comparison_widget.playback_speed = speed
+            if self.comparison_widget and self.comparison_widget.is_playing:
+                self.comparison_widget.stop_playback()
+                self.comparison_widget.start_playback(speed)
+        elif self.is_using_frame_player and self.frame_player and self.frame_player.is_playing:
+            self.frame_player.play(speed)
+        elif not self.has_vlc_player():
+            return
+        else:
+            try:
+                self.vlc_player.set_rate(speed)
+            except Exception:
+                pass
+        self.update_unified_playback_ui()
+
+    def on_unified_slider_pressed(self):
+        if self.current_display_mode() == "comparison":
+            if self.comparison_widget and self.comparison_widget.is_playing:
+                self.comparison_widget.stop_playback()
+        elif self.is_using_frame_player and self.frame_player and self.frame_player.is_playing:
+            self.frame_player.pause()
+        elif not self.has_vlc_player():
+            return
+        else:
+            state = self.vlc_player.get_state()
+            if state == vlc.State.Playing:
+                self.vlc_player.pause()
+        self.update_unified_playback_ui()
+
+    def on_unified_slider_moved(self, value):
+        if self.current_display_mode() == "comparison":
+            if self.comparison_widget:
+                self.comparison_widget.seek_active_player(value)
+        elif self.is_using_frame_player and self.frame_player:
+            self.frame_player.show_frame(value)
+        elif not self.has_vlc_player():
+            return
+        else:
+            self.seek_preview_to_ms(value)
+        self.update_unified_playback_ui()
+
+    def on_unified_slider_released(self):
+        self.update_unified_playback_ui()
+
+    def seek_preview_by_offset(self, direction):
+        """按预估帧长前后移动预览视频。"""
+        if not os.path.exists(self.preview_path):
+            return
+        fps = get_video_fps(self.preview_path)
+        frame_ms = int(1000 / fps) if fps > 0 else 33
+        current_time = max(0, self.vlc_player.get_time())
+        self.seek_preview_to_ms(max(0, current_time + direction * frame_ms))
+
+    def seek_preview_to_ms(self, target_ms):
+        if target_ms < 0:
+            target_ms = 0
+        try:
+            self.vlc_player.set_time(int(target_ms))
+        except Exception:
+            pass
+
+    def update_unified_playback_ui(self):
+        """根据当前 Tab 更新统一播放控制模块显示。"""
+        if not self.has_unified_controls():
+            return
+
+        if self.current_display_mode() == "comparison":
+            info = self.comparison_widget.get_active_media_info() if self.comparison_widget else None
+            self.unified_prev_button.setEnabled(bool(info))
+            self.unified_next_button.setEnabled(bool(info))
+            self.unified_progress_slider.blockSignals(True)
+            if info:
+                total_frames = info['total_frames']
+                frame_idx = info['frame_index']
+                total_time = total_frames / info['fps'] if info['fps'] > 0 else 0
+                self.unified_progress_slider.setMaximum(max(0, total_frames - 1))
+                self.unified_progress_slider.setValue(frame_idx)
+                self.unified_info_label.setText(
+                    f"当前: {frame_idx} / {total_frames} 帧    {info['time_seconds']:.2f}s / {total_time:.2f}s"
+                )
+            else:
+                self.unified_progress_slider.setMaximum(1000)
+                self.unified_progress_slider.setValue(0)
+                self.unified_info_label.setText("当前: 0 / 0 帧    0.00s / 0.00s")
+            self.unified_progress_slider.blockSignals(False)
+            self.unified_play_button.setText("⏸ 暂停" if self.comparison_widget and self.comparison_widget.is_playing else "▶ 播放")
+            return
+
+        if self.is_using_frame_player and self.frame_player:
+            info = self.frame_player.get_current_frame_info()
+            self.unified_progress_slider.blockSignals(True)
+            if info:
+                total_frames = info['total_frames']
+                frame_idx = info['frame_index']
+                total_time = total_frames / info['fps'] if info['fps'] > 0 else 0
+                self.unified_progress_slider.setMaximum(max(0, total_frames - 1))
+                self.unified_progress_slider.setValue(frame_idx)
+                self.unified_info_label.setText(
+                    f"当前: {frame_idx} / {total_frames} 帧    {info['time_seconds']:.2f}s / {total_time:.2f}s"
+                )
+            else:
+                self.unified_progress_slider.setMaximum(1000)
+                self.unified_progress_slider.setValue(0)
+                self.unified_info_label.setText("当前: 0 / 0 帧    0.00s / 0.00s")
+            self.unified_progress_slider.blockSignals(False)
+            self.unified_prev_button.setEnabled(bool(info))
+            self.unified_next_button.setEnabled(bool(info))
+            self.unified_play_button.setText("⏸ 暂停" if self.frame_player.is_playing else "▶ 播放")
+            return
+
+        if not self.has_vlc_player():
+            self.unified_progress_slider.blockSignals(True)
+            self.unified_progress_slider.setMaximum(1000)
+            self.unified_progress_slider.setValue(0)
+            self.unified_progress_slider.blockSignals(False)
+            self.unified_prev_button.setEnabled(False)
+            self.unified_next_button.setEnabled(False)
+            self.unified_info_label.setText("当前: 0.00s / 0.00s")
+            self.unified_play_button.setText("▶ 播放")
+            return
+
+        current_time = max(0, self.vlc_player.get_time())
+        total_time = max(0, self.vlc_player.get_length())
+        self.unified_progress_slider.blockSignals(True)
+        self.unified_progress_slider.setMaximum(max(1000, total_time))
+        self.unified_progress_slider.setValue(min(current_time, self.unified_progress_slider.maximum()))
+        self.unified_progress_slider.blockSignals(False)
+        self.unified_prev_button.setEnabled(os.path.exists(self.preview_path))
+        self.unified_next_button.setEnabled(os.path.exists(self.preview_path))
+        self.unified_info_label.setText(
+            f"当前: {current_time / 1000:.2f}s / {total_time / 1000:.2f}s"
+            if total_time > 0 else "当前: 0.00s / 0.00s"
+        )
+        state = self.vlc_player.get_state()
+        self.unified_play_button.setText("⏸ 暂停" if state == vlc.State.Playing else "▶ 播放")
 
     # -------------------------------------------------------
     #   同步速度与时长（用户改一个，另一个自动同步）
@@ -2704,6 +2739,8 @@ class MainWindow(QWidget):
     def on_hit_video_selection_changed(self):
         """击球对齐模式下，视频选择改变时的处理"""
         self.update_hit_moment_display()
+        if self.current_align_mode == 1:
+            self.load_hit_video_for_marking()
         
     def update_hit_moment_display(self):
         """更新击球时刻显示信息"""
@@ -2723,49 +2760,36 @@ class MainWindow(QWidget):
             )
         else:
             self.hit_moment_label.setText("击球时刻: 未设置")
-    
-    def play_single_video_for_hit_moment(self):
-        """播放单个视频以便设置击球时刻（使用精确帧播放器）"""
+
+    def load_hit_video_for_marking(self):
+        """将当前击球对齐目标视频加载到预览区，交由统一播放控制模块控制。"""
         idx = self.hit_video_combo.currentIndex()
         if idx < 0 or idx >= len(self.all_video_paths):
-            self.status_label.setText("请先选择一个视频")
             return
-        
+
         current_path = self.all_video_paths[idx]
-        
-        # 停止VLC播放器（如果正在使用）
-        if not self.is_using_frame_player:
-            self.vlc_player.stop()
-        
-        # 切换到帧播放器模式
+
+        self.vlc_player.stop()
         self.is_using_frame_player = True
-        
-        # 使用帧播放器加载视频
+
         total_frames, fps = self.frame_player.load_video(current_path)
-        
         if total_frames is None:
             self.status_label.setText(f"无法加载视频: {os.path.basename(current_path)}")
             self.is_using_frame_player = False
             return
-        
-        # 获取播放速度
-        speed_text = self.hit_playback_speed.currentText()
-        speed_map = {
-            "0.1x": 0.1,
-            "0.25x": 0.25,
-            "0.5x": 0.5,
-            "0.75x": 0.75,
-            "1.0x": 1.0
-        }
-        speed = speed_map.get(speed_text, 1.0)
-        
-        # 开始播放
-        self.frame_player.play(speed)
-        
+
+        self.preview_tab_widget.setCurrentIndex(0)
         self.status_label.setText(
-            f"[精确模式] 播放: {os.path.basename(current_path)} | "
-            f"总帧数: {total_frames} | FPS: {fps:.2f}"
+            f"[击球对齐] 已加载: {os.path.basename(current_path)} | "
+            f"总帧数: {total_frames} | FPS: {fps:.2f} | 请使用下方统一播放控制定位"
         )
+        self.update_unified_playback_ui()
+    
+    def play_single_video_for_hit_moment(self):
+        """播放单个视频以便设置击球时刻（使用精确帧播放器）"""
+        self.load_hit_video_for_marking()
+        if self.is_using_frame_player:
+            self.frame_player.play(self.get_unified_speed_value())
 
 
     # 暂停方法支持帧播放器
@@ -2791,23 +2815,7 @@ class MainWindow(QWidget):
     
     def change_hit_playback_speed(self, speed_text):
         """改变击球时刻设置时的播放速度"""
-        speed_map = {
-            "0.1x": 0.1,
-            "0.25x": 0.25,
-            "0.5x": 0.5,
-            "0.75x": 0.75,
-            "1.0x": 1.0
-        }
-        speed = speed_map.get(speed_text, 1.0)
-        
-        if self.is_using_frame_player and self.frame_player.is_playing:
-            # 如果正在使用帧播放器播放，重新开始播放以应用新速度
-            self.frame_player.play(speed)
-        else:
-            # 使用VLC时
-            self.vlc_player.set_rate(speed)
-        
-        self.status_label.setText(f"播放速度已设置为 {speed_text}")
+        self.update_unified_playback_ui()
     
     # 逐帧控制方法
     def prev_frame_for_hit(self):
@@ -3089,6 +3097,7 @@ class MainWindow(QWidget):
         if success:
             self.progress.setValue(100)
             self.status_label.setText("预览生成完成，正在加载 VLC……")
+            self.preview_tab_widget.setCurrentIndex(0)
             self.play_preview()
         else:
             self.status_label.setText(message)
@@ -3101,8 +3110,7 @@ class MainWindow(QWidget):
         media = self.vlc_instance.media_new(self.preview_path)
 
         self.vlc_player.set_media(media)
-        # 强制重置播放速度为 1.0 (正常速度)
-        self.vlc_player.set_rate(1.0) 
+        self.vlc_player.set_rate(self.get_unified_speed_value())
         self.vlc_player.play()
 
         # 重置手动停止标志，表示当前是正常播放
@@ -3116,6 +3124,7 @@ class MainWindow(QWidget):
 
         # 播放开始时将焦点设置回主窗口，以便响应空格键
         self.setFocus()
+        self.update_unified_playback_ui()
 
     def stop_preview(self):
         # 获取当前状态
@@ -3143,6 +3152,7 @@ class MainWindow(QWidget):
             self.status_label.setText("正在播放……")
             if not self.vlc_timer.isActive():
                 self.vlc_timer.start()
+        self.update_unified_playback_ui()
 
     def update_preview_status(self):
         state = self.vlc_player.get_state()
@@ -3151,6 +3161,7 @@ class MainWindow(QWidget):
         if state in [vlc.State.Ended, vlc.State.Stopped, vlc.State.Error]:
             self.status_label.setText("播放结束")
             self.vlc_timer.stop()
+        self.update_unified_playback_ui()
 
     def on_vlc_end(self, event):
         """
@@ -3179,6 +3190,7 @@ class MainWindow(QWidget):
         else:
             self.vlc_timer.stop()
             self.status_label.setText("预览播放结束")
+        self.update_unified_playback_ui()
     
     # 重写键盘事件处理，支持空格键暂停/继续
     def keyPressEvent(self, event):
@@ -3186,24 +3198,22 @@ class MainWindow(QWidget):
         # 使用 PySide6 标准枚举 Qt.Key.Key_Space
         # -------------------------------------------------------------
         # 如果按下空格键，且焦点未被输入框等控件捕获，则触发暂停/继续
-        if event.key() == Qt.Key.Key_Space:
+        if event.key() == Qt.Key.Key_Space and self.current_display_mode() == "preview":
             self.stop_preview()
         else:
             super().keyPressEvent(event)
 
-    # -------------------------------------------------------------
-    # 导出最终视频也使用多线程
-    # -------------------------------------------------------------
     def export_final(self):
-        # ===== 宽高比一致性检测（严格模式） =====
+        """导出最终对比视频：增加路径选择交互并修复未定义报错"""
+        # 1. 前置检查：是否有视频
         if not self.all_video_paths:
             self.status_label.setText("请先导入视频文件")
             return
         
+        # 2. 宽高比一致性检测（严格模式）
         is_consistent, video_info = check_aspect_ratio_consistency(self.all_video_paths)
         
         if not is_consistent:
-            # 构建详细的提示信息
             details_lines = []
             for info in video_info:
                 details_lines.append(f"  • {info['name']}: {info['size']} (宽高比 {info['ratio']:.4f})")
@@ -3216,19 +3226,13 @@ class MainWindow(QWidget):
                 f"📋 当前视频列表：\n{details}\n\n"
                 f"💡 建议操作：\n"
                 f"  1. 使用【✂ 动作片段剪辑器】统一裁剪为相同比例\n"
-                f"  2. 或重新拍摄/导入相同方向的视频（全部横屏或全部竖屏）\n"
-                f"  3. 确保所有视频都是16:9或都是9:16等统一比例\n\n"
+                f"  2. 或重新拍摄相同方向的视频（全部横屏或全部竖屏）\n\n"
                 f"✅ 调整完成后，请重新导入视频并导出。"
             )
             self.status_label.setText("⚠ 操作已取消：视频宽高比不一致")
-            return  # 阻止继续执行
-        
-        # 检查是否有正在运行的线程
-        if self.video_thread and self.video_thread.isRunning():
-            self.status_label.setText("已有视频正在生成，请等待完成...")
-            return
-        
-        # 验证时长参数
+            return 
+
+        # 3. 验证时长参数
         try:
             target_total_duration = float(self.duration_input.text())
             if target_total_duration <= 0.01:
@@ -3237,10 +3241,29 @@ class MainWindow(QWidget):
             self.status_label.setText("错误：导出前必须指定有效的播放时长")
             return
 
+        # 4. 检查是否有正在运行的线程
+        if self.video_thread and self.video_thread.isRunning():
+            self.status_label.setText("已有视频正在生成，请等待完成...")
+            return
+
+        # 5. 【核心修复】弹出保存对话框，锁定 save_path
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "保存最终对比视频", 
+            "comparison_output.mp4", 
+            "MP4 Files (*.mp4)"
+        )
+        
+        # 如果用户点击了取消，则退出流程
+        if not save_path:
+            self.status_label.setText("操作已取消：未选择保存路径")
+            return
+
+        # 6. 开始导出准备
         self.status_label.setText("正在导出最终视频……")
         self.progress.setValue(0)
         
-        # 准备配置（与预览类似，但使用更高质量参数）
+        # 准备配置签名
         export_config = {
             "paths": list(self.all_video_paths),
             "ref_paths": list(self.ref_paths),
@@ -3248,12 +3271,10 @@ class MainWindow(QWidget):
             "speed": float(self.speed_input.text() or 1.0),
             "duration": target_total_duration,
             "settings": copy.deepcopy(self.video_settings),
-            # 传入当前对齐模式
             "align_mode": self.current_align_mode
         }
         
-        # 创建导出线程（需要修改VideoGeneratorThread支持自定义参数）
-        # 为了区分预览和导出，创建一个子类或传入额外参数
+        # 7. 创建并启动导出线程（传入已定义的 save_path）
         self.video_thread = ExportVideoThread(export_config, save_path)
         
         # 连接信号
@@ -3312,48 +3333,18 @@ class MainWindow(QWidget):
         except Exception as e:
             self.status_label.setText(f"导入片段失败: {str(e)}")
 
-    # 界面切换方法
     def switch_to_comparison_mode(self):
-        """切换到视频对比模式"""
-        # 检查是否有视频
+        """兼容旧入口：切换到主界面中的视频对比 Tab。"""
         if not self.ref_paths and not self.user_paths:
             self.status_label.setText("请先导入视频文件")
             return
-        
-        # 如果对比界面尚未创建，则创建
-        if self.comparison_widget is None:
-            self.comparison_widget = VideoComparisonWidget(
-                self.ref_paths, 
-                self.user_paths,
-                self
-            )
-            # 连接返回信号
-            self.comparison_widget.return_to_main.connect(self.switch_to_main_mode)
-            
-            # 添加到 StackedWidget
-            self.stacked_widget.addWidget(self.comparison_widget)
-        else:
-            # 如果已创建，更新视频列表（以防用户在主界面添加了新视频）
-            self.comparison_widget.ref_paths = self.ref_paths
-            self.comparison_widget.user_paths = self.user_paths
-            
-            # 更新下拉框
-            self.comparison_widget.ref_combo.clear()
-            for i, path in enumerate(self.ref_paths):
-                self.comparison_widget.ref_combo.addItem(f"{i+1}. {os.path.basename(path)}", path)
-            
-            self.comparison_widget.user_combo.clear()
-            for i, path in enumerate(self.user_paths):
-                self.comparison_widget.user_combo.addItem(f"{i+1}. {os.path.basename(path)}", path)
-        
-        # 切换到对比界面
-        self.stacked_widget.setCurrentWidget(self.comparison_widget)
-        print("[主界面] 切换到视频对比模式")
+        self.preview_tab_widget.setCurrentIndex(1)
+        self.on_display_tab_changed(1)
     
     def switch_to_main_mode(self):
-        """返回主界面"""
-        self.stacked_widget.setCurrentIndex(0)
-        print("[主界面] 返回主功能界面")
+        """兼容旧入口：切回主界面预览 Tab。"""
+        self.preview_tab_widget.setCurrentIndex(0)
+        self.on_display_tab_changed(0)
 
     # 添加资源清理
     def closeEvent(self, event):

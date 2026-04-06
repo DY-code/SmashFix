@@ -2,4 +2,11 @@
 *.avi
 *.mov
 *.mkv
+
+note.txt
+code_refine_codex.txt
+
 __pycache__/
+.marscode
+.codex 
+.venv
