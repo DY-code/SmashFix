@@ -20,7 +20,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QThread, QRect, QPoint
 from PySide6.QtGui import (
     QIntValidator, QPainter, QColor, QPen, QBrush, QImage, QPixmap, QPainterPath
 )
-from PySide6.QtWidgets import QFormLayout, QLineEdit
+from PySide6.QtWidgets import QLineEdit
 
 from moviepy.editor import VideoFileClip, clips_array, ColorClip
 from moviepy.video.fx.all import speedx
@@ -647,6 +647,7 @@ class VideoGeneratorThread(QThread):
             video_settings = self.config['settings']
             # 获取当前的对齐模式 (默认为 0: 手动)
             align_mode = self.config.get('align_mode', 0)
+            layout_mode = self.config.get('layout_mode', 'horizontal')
             
             # ===== 新增：检测最大分辨率 =====
             target_size = detect_max_resolution(all_paths)
@@ -710,25 +711,24 @@ class VideoGeneratorThread(QThread):
             # 4. 构建网格布局
             from moviepy.editor import clips_array, ColorClip
             
-            rows = max(len(ref_clips), len(user_clips))
             default_size = target_size  # 修改：使用检测到的最大分辨率
 
-            grid = []
-            for r in range(rows):
-                row_items = []
-                # 左列：参考
-                if r < len(ref_clips):
-                    row_items.append(ref_clips[r])
-                else:
-                    row_items.append(ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
-                
-                # 右列：用户
-                if r < len(user_clips):
-                    row_items.append(user_clips[r])
-                else:
-                    row_items.append(ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
-                
-                grid.append(row_items)
+            if layout_mode == 'vertical':
+                cols = max(len(ref_clips), len(user_clips))
+                ref_row = []
+                user_row = []
+                for c in range(cols):
+                    ref_row.append(ref_clips[c] if c < len(ref_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                    user_row.append(user_clips[c] if c < len(user_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                grid = [ref_row, user_row]
+            else:
+                rows = max(len(ref_clips), len(user_clips))
+                grid = []
+                for r in range(rows):
+                    row_items = []
+                    row_items.append(ref_clips[r] if r < len(ref_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                    row_items.append(user_clips[r] if r < len(user_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                    grid.append(row_items)
 
             final = clips_array(grid).without_audio()
             
@@ -793,6 +793,7 @@ class ExportVideoThread(VideoGeneratorThread):
             video_settings = self.config['settings']
             # 获取当前的对齐模式
             align_mode = self.config.get('align_mode', 0)
+            layout_mode = self.config.get('layout_mode', 'horizontal')
             
             # ===== 新增：检测最大分辨率 =====
             target_size = detect_max_resolution(all_paths)
@@ -852,23 +853,24 @@ class ExportVideoThread(VideoGeneratorThread):
             # 4. 构建网格布局
             from moviepy.editor import clips_array, ColorClip
             
-            rows = max(len(ref_clips), len(user_clips))
             default_size = target_size  # 修改：使用检测到的最大分辨率
 
-            grid = []
-            for r in range(rows):
-                row_items = []
-                if r < len(ref_clips):
-                    row_items.append(ref_clips[r])
-                else:
-                    row_items.append(ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
-                
-                if r < len(user_clips):
-                    row_items.append(user_clips[r])
-                else:
-                    row_items.append(ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
-                
-                grid.append(row_items)
+            if layout_mode == 'vertical':
+                cols = max(len(ref_clips), len(user_clips))
+                ref_row = []
+                user_row = []
+                for c in range(cols):
+                    ref_row.append(ref_clips[c] if c < len(ref_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                    user_row.append(user_clips[c] if c < len(user_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                grid = [ref_row, user_row]
+            else:
+                rows = max(len(ref_clips), len(user_clips))
+                grid = []
+                for r in range(rows):
+                    row_items = []
+                    row_items.append(ref_clips[r] if r < len(ref_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                    row_items.append(user_clips[r] if r < len(user_clips) else ColorClip(size=default_size, color=(0,0,0), duration=target_duration))
+                    grid.append(row_items)
 
             # 导出时保留音频
             final = clips_array(grid)
@@ -1083,6 +1085,7 @@ class VideoComparisonWidget(QWidget):
         self.play_timer.timeout.connect(self.on_play_timer)
         self.is_playing = False
         self.playback_speed = 0.25
+        self.layout_mode = "horizontal"
         
         # 构建UI
         self.build_ui()
@@ -1104,7 +1107,7 @@ class VideoComparisonWidget(QWidget):
         main_layout.addWidget(title_label)
 
         # ===== 1. 视频显示区域（左右分屏） =====
-        video_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.video_splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # 左侧视频区域
         self.left_video_label = QLabel("参考视频区域")
@@ -1112,7 +1115,7 @@ class VideoComparisonWidget(QWidget):
         self.left_video_label.setStyleSheet("background-color: black; color: gray;")
         self.left_video_label.setMinimumSize(400, 300)
         self.left_video_label.mousePressEvent = lambda e: self.switch_active_player(0)
-        video_splitter.addWidget(self.left_video_label)
+        self.video_splitter.addWidget(self.left_video_label)
         
         # 右侧视频区域
         self.right_video_label = QLabel("用户视频区域")
@@ -1120,13 +1123,13 @@ class VideoComparisonWidget(QWidget):
         self.right_video_label.setStyleSheet("background-color: black; color: gray;")
         self.right_video_label.setMinimumSize(400, 300)
         self.right_video_label.mousePressEvent = lambda e: self.switch_active_player(1)
-        video_splitter.addWidget(self.right_video_label)
+        self.video_splitter.addWidget(self.right_video_label)
         
         # 设置均分比例
-        video_splitter.setStretchFactor(0, 1)
-        video_splitter.setStretchFactor(1, 1)
+        self.video_splitter.setStretchFactor(0, 1)
+        self.video_splitter.setStretchFactor(1, 1)
         
-        main_layout.addWidget(video_splitter, stretch=1)
+        main_layout.addWidget(self.video_splitter, stretch=1)
 
         # ===== 2. 视频选择区域 =====
         selection_layout = QHBoxLayout()
@@ -1370,6 +1373,13 @@ class VideoComparisonWidget(QWidget):
 
     def get_active_media_info(self):
         return self.update_info_display()
+
+    def set_layout_mode(self, layout_mode):
+        """切换视频对比区排版。"""
+        self.layout_mode = layout_mode
+        orientation = Qt.Orientation.Horizontal if layout_mode == "horizontal" else Qt.Orientation.Vertical
+        self.video_splitter.setOrientation(orientation)
+        self.notify_host()
 
 
 class ClipEditorWindow(QDialog):
@@ -1734,6 +1744,8 @@ class MainWindow(QWidget):
         
         # 当前对齐模式: 0=手动对齐, 1=击球时刻对齐
         self.current_align_mode = 0
+        self.layout_mode = "horizontal"
+        self.aligned_target_duration = None
 
         self.preview_path = "preview.mp4"
         # 缓存上一次生成视频的配置，用于判断是否需要重新生成
@@ -1858,10 +1870,7 @@ class MainWindow(QWidget):
         # 【模块2】对齐模式设置模块
         self._build_alignment_mode_module(left_panel)
 
-        # 【模块3】播放速度/时长设置模块
-        self._build_speed_duration_module(left_panel)
-
-        # 【模块4】生成/导出模块
+        # 【模块3】生成/导出模块
         self._build_generation_module(left_panel)
 
         left_panel.addStretch()
@@ -1894,6 +1903,7 @@ class MainWindow(QWidget):
         self._build_unified_playback_module(right_panel)
 
         main_layout.addLayout(right_panel, stretch=4)
+        self.refresh_duration_display()
         self.update_unified_playback_ui()
     
     def _build_video_import_module(self, parent_layout):
@@ -2102,46 +2112,8 @@ class MainWindow(QWidget):
         
         parent_layout.addWidget(group_box)
     
-    def _build_speed_duration_module(self, parent_layout):
-        """【模块3】构建播放速度/时长设置模块"""
-        from PySide6.QtWidgets import QGroupBox
-        
-        group_box = QGroupBox("⏱️ 播放速度/时长设置")
-        group_box.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                border: 2px solid #FF6B6B;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }
-        """)
-        
-        module_layout = QVBoxLayout(group_box)
-        
-        self.speed_input = QLineEdit("1.0")
-        self.duration_input = QLineEdit("")
-        self.speed_input.setPlaceholderText("统一速度，例如 1.0")
-        self.duration_input.setPlaceholderText("统一播放时长（秒）")
-        
-        form_global = QFormLayout()
-        form_global.addRow("播放速度", self.speed_input)
-        form_global.addRow("播放时长(秒)", self.duration_input)
-        module_layout.addLayout(form_global)
-        
-        # 自动同步 speed <-> duration
-        self.speed_input.textChanged.connect(self.sync_duration_from_speed)
-        self.duration_input.textChanged.connect(self.sync_speed_from_duration)
-        
-        parent_layout.addWidget(group_box)
-    
     def _build_generation_module(self, parent_layout):
-        """【模块4】构建生成与导出模块。"""
+        """【模块3】构建生成与导出模块。"""
         from PySide6.QtWidgets import QGroupBox
         
         group_box = QGroupBox("🎬 预览生成与导出")
@@ -2164,6 +2136,15 @@ class MainWindow(QWidget):
         
         self.loop_checkbox = QCheckBox("循环播放")
         module_layout.addWidget(self.loop_checkbox)
+
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("排版选择"))
+        self.layout_mode_combo = QComboBox()
+        self.layout_mode_combo.addItem("水平排版", "horizontal")
+        self.layout_mode_combo.addItem("竖直排版", "vertical")
+        self.layout_mode_combo.currentIndexChanged.connect(self.on_layout_mode_changed)
+        layout_row.addWidget(self.layout_mode_combo, stretch=1)
+        module_layout.addLayout(layout_row)
         
         btn_preview = QPushButton("▶ 生成并播放对比视频")
         btn_preview.clicked.connect(self.generate_preview)
@@ -2222,12 +2203,20 @@ class MainWindow(QWidget):
         button_row.addWidget(QLabel("速度:"))
         self.unified_speed_combo = QComboBox()
         self.unified_speed_combo.addItems(["0.1x", "0.25x", "0.5x", "1.0x"])
-        self.unified_speed_combo.setCurrentText("0.25x")
+        self.unified_speed_combo.setCurrentText("1.0x")
         self.unified_speed_combo.currentTextChanged.connect(self.on_unified_speed_changed)
         button_row.addWidget(self.unified_speed_combo)
         button_row.addStretch()
 
         module_layout.addLayout(button_row)
+
+        duration_row = QHBoxLayout()
+        duration_row.addWidget(QLabel("播放时长"))
+        self.unified_duration_label = QLabel("--")
+        self.unified_duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.unified_duration_label.setStyleSheet("color: #2C3E50; font-weight: bold;")
+        duration_row.addWidget(self.unified_duration_label, stretch=1)
+        module_layout.addLayout(duration_row)
 
         self.unified_progress_slider = QSlider(Qt.Orientation.Horizontal)
         self.unified_progress_slider.setMinimum(0)
@@ -2301,19 +2290,34 @@ class MainWindow(QWidget):
 
     def reset_speed_duration_defaults(self):
         """将播放速度/时长恢复为基于原始视频的默认值。"""
-        self.speed_input.blockSignals(True)
-        self.duration_input.blockSignals(True)
+        self.aligned_target_duration = None
+        self.unified_speed_combo.blockSignals(True)
+        self.unified_speed_combo.setCurrentText("1.0x")
+        self.unified_speed_combo.blockSignals(False)
+        self.refresh_duration_display()
 
-        self.speed_input.setText("1.0")
+    def get_source_duration_seconds(self):
+        """获取当前自动时长计算的基准秒数。"""
+        if self.current_align_mode == 1 and self.aligned_target_duration is not None:
+            return self.aligned_target_duration
+        if not self.all_video_paths:
+            return 0.0
+        return max(VideoFileClip(p).duration for p in self.all_video_paths)
 
-        if self.all_video_paths:
-            max_raw = max(VideoFileClip(p).duration for p in self.all_video_paths)
-            self.duration_input.setText(f"{max_raw:.2f}")
-        else:
-            self.duration_input.clear()
+    def get_output_duration_seconds(self):
+        """根据当前速度计算最终输出时长。"""
+        base_duration = self.get_source_duration_seconds()
+        speed = self.get_unified_speed_value()
+        if speed <= 0:
+            return base_duration
+        return base_duration / speed
 
-        self.speed_input.blockSignals(False)
-        self.duration_input.blockSignals(False)
+    def refresh_duration_display(self):
+        """刷新统一播放控制中的只读时长展示。"""
+        if not hasattr(self, "unified_duration_label"):
+            return
+        duration = self.get_output_duration_seconds()
+        self.unified_duration_label.setText(f"{duration:.2f} 秒" if duration > 0 else "--")
 
     def import_ref_video(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择参考视频", "", "Video (*.mp4 *.mov *.mkv *.avi)")
@@ -2395,6 +2399,12 @@ class MainWindow(QWidget):
         """返回当前右侧播放区域模式。"""
         return "comparison" if self.preview_tab_widget.currentIndex() == 1 else "preview"
 
+    def on_layout_mode_changed(self, index):
+        """统一处理排版模式切换。"""
+        self.layout_mode = self.layout_mode_combo.currentData() or "horizontal"
+        if self.comparison_widget:
+            self.comparison_widget.set_layout_mode(self.layout_mode)
+
     def on_display_tab_changed(self, index):
         """切换显示 Tab 时刷新统一控制模块。"""
         if index == 1 and self.comparison_widget:
@@ -2456,6 +2466,7 @@ class MainWindow(QWidget):
 
     def on_unified_speed_changed(self, speed_text):
         speed = self.get_unified_speed_value()
+        self.refresh_duration_display()
         if self.current_display_mode() == "comparison":
             if self.comparison_widget:
                 self.comparison_widget.playback_speed = speed
@@ -2594,48 +2605,6 @@ class MainWindow(QWidget):
         state = self.vlc_player.get_state()
         self.unified_play_button.setText("⏸ 暂停" if state == vlc.State.Playing else "▶ 播放")
 
-    # -------------------------------------------------------
-    #   同步速度与时长（用户改一个，另一个自动同步）
-    # -------------------------------------------------------
-    def sync_duration_from_speed(self):
-        """当用户修改 speed 时自动更新 duration"""
-        if not self.all_video_paths:
-            return
-
-        try:
-            speed = float(self.speed_input.text())
-            if speed <= 0:
-                return
-        except:
-            return
-
-        # 获取最长原视频时长
-        max_raw = max(VideoFileClip(p).duration for p in self.all_video_paths)
-
-        self.duration_input.blockSignals(True)
-        self.duration_input.setText(str(max_raw / speed))
-        self.duration_input.blockSignals(False)
-
-    def sync_speed_from_duration(self):
-        """当用户修改 duration 时自动更新 speed"""
-        if not self.all_video_paths:
-            return
-
-        try:
-            target = float(self.duration_input.text())
-            if target <= 0:
-                return
-        except:
-            return
-
-        max_raw = max(VideoFileClip(p).duration for p in self.all_video_paths)
-
-        speed = max_raw / target
-
-        self.speed_input.blockSignals(True)
-        self.speed_input.setText(str(speed))
-        self.speed_input.blockSignals(False)
-
     # -------------------------------------------------------------
     #   设置保存与加载逻辑
     # -------------------------------------------------------------
@@ -2735,6 +2704,7 @@ class MainWindow(QWidget):
         else:  # 击球时刻对齐模式
             # 更新击球时刻显示
             self.update_hit_moment_display()
+        self.refresh_duration_display()
     
     def on_hit_video_selection_changed(self):
         """击球对齐模式下，视频选择改变时的处理"""
@@ -2974,7 +2944,8 @@ class MainWindow(QWidget):
             base_info = max(video_infos, key=lambda x: x['ratio'])
             # 统一时长 = 基准视频的 before + after
             unified_duration = base_info['before_available'] + base_info['after_available']
-            self.duration_input.setText(f"{unified_duration:.2f}")
+            self.aligned_target_duration = unified_duration
+            self.refresh_duration_display()
             
             print(f"\n统一目标时长: {unified_duration:.3f}秒")
             print("=" * 60)
@@ -3042,11 +3013,12 @@ class MainWindow(QWidget):
             "paths": list(self.all_video_paths),
             "ref_paths": list(self.ref_paths),  # 添加分组路径
             "user_paths": list(self.user_paths),
-            "speed": float(self.speed_input.text() or 1.0),
-            "duration": float(self.duration_input.text() or 0),
+            "speed": self.get_unified_speed_value(),
+            "duration": self.get_output_duration_seconds(),
             "settings": copy.deepcopy(self.video_settings),
             # 传入当前对齐模式
-            "align_mode": self.current_align_mode
+            "align_mode": self.current_align_mode,
+            "layout_mode": self.layout_mode
         }
 
         if self.last_config == current_config and os.path.exists(self.preview_path):
@@ -3062,11 +3034,8 @@ class MainWindow(QWidget):
         self.vlc_player.set_media(None)
 
         # 验证时长参数
-        try:
-            target_total_duration = float(self.duration_input.text())
-            if target_total_duration <= 0.01:
-                raise ValueError
-        except ValueError:
+        target_total_duration = self.get_output_duration_seconds()
+        if target_total_duration <= 0.01:
             self.status_label.setText("错误：必须指定有效的播放时长（秒）")
             return
 
@@ -3148,6 +3117,11 @@ class MainWindow(QWidget):
             self.status_label.setText("播放已暂停")
             # 这里不再停止 vlc_timer，以便检测后续可能的状态变化（如用户再次点击恢复播放）
         elif state == vlc.State.Playing:
+            # 恢复播放时显式重设速度，确保使用统一播放控制中的最新值。
+            try:
+                self.vlc_player.set_rate(self.get_unified_speed_value())
+            except Exception:
+                pass
             self.is_manual_stop = False # 恢复播放状态，允许循环逻辑生效
             self.status_label.setText("正在播放……")
             if not self.vlc_timer.isActive():
@@ -3194,14 +3168,27 @@ class MainWindow(QWidget):
     
     # 重写键盘事件处理，支持空格键暂停/继续
     def keyPressEvent(self, event):
-        # -------------------------------------------------------------
-        # 使用 PySide6 标准枚举 Qt.Key.Key_Space
-        # -------------------------------------------------------------
-        # 如果按下空格键，且焦点未被输入框等控件捕获，则触发暂停/继续
-        if event.key() == Qt.Key.Key_Space and self.current_display_mode() == "preview":
-            self.stop_preview()
-        else:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, (QLineEdit, QComboBox, QListWidget)):
             super().keyPressEvent(event)
+            return
+
+        if event.key() == Qt.Key.Key_Left:
+            self.on_unified_prev_frame()
+            event.accept()
+            return
+
+        if event.key() == Qt.Key.Key_Right:
+            self.on_unified_next_frame()
+            event.accept()
+            return
+
+        if event.key() == Qt.Key.Key_Space:
+            self.on_unified_play_pause()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
 
     def export_final(self):
         """导出最终对比视频：增加路径选择交互并修复未定义报错"""
@@ -3233,11 +3220,8 @@ class MainWindow(QWidget):
             return 
 
         # 3. 验证时长参数
-        try:
-            target_total_duration = float(self.duration_input.text())
-            if target_total_duration <= 0.01:
-                raise ValueError
-        except ValueError:
+        target_total_duration = self.get_output_duration_seconds()
+        if target_total_duration <= 0.01:
             self.status_label.setText("错误：导出前必须指定有效的播放时长")
             return
 
@@ -3268,10 +3252,11 @@ class MainWindow(QWidget):
             "paths": list(self.all_video_paths),
             "ref_paths": list(self.ref_paths),
             "user_paths": list(self.user_paths),
-            "speed": float(self.speed_input.text() or 1.0),
+            "speed": self.get_unified_speed_value(),
             "duration": target_total_duration,
             "settings": copy.deepcopy(self.video_settings),
-            "align_mode": self.current_align_mode
+            "align_mode": self.current_align_mode,
+            "layout_mode": self.layout_mode
         }
         
         # 7. 创建并启动导出线程（传入已定义的 save_path）
